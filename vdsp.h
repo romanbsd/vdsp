@@ -120,6 +120,9 @@ void vDSP_vadd(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride
 void vDSP_vsub(const float *__B, vDSP_Stride __IB, const float *__A, vDSP_Stride __IA, float *__C,
                vDSP_Stride __IC, vDSP_Length __N);
 
+/* Real vector absolute values; single precision. */
+void vDSP_vabs(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC, vDSP_Length __N);
+
 /* Vector convert power or amplitude to decibels; single precision. */
 void vDSP_vdbcon(const float *__A, vDSP_Stride __IA, const float *__B, float *__C, vDSP_Stride __IC,
                  vDSP_Length __N, unsigned int __F);

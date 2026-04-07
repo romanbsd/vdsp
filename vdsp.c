@@ -321,6 +321,22 @@ void vDSP_vsub(const float *__B, vDSP_Stride __IB, const float *__A, vDSP_Stride
     }
 }
 
+void vDSP_vabs(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC, vDSP_Length __N) {
+    vDSP_Length n = 0;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3UL;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            vst1q_f32(__C + n, vabsq_f32(a));
+        }
+    }
+#endif
+    for (; n < __N; ++n) {
+        __C[n * __IC] = fabsf(__A[n * __IA]);
+    }
+}
+
 void vDSP_vmul(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB, float *__C,
                vDSP_Stride __IC, vDSP_Length __N) {
 #ifdef __ARM_NEON
