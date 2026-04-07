@@ -1,4 +1,5 @@
 #include <string.h>
+#include <float.h>
 #include <math.h>
 #include <assert.h>
 #include "vdsp.h"
@@ -195,6 +196,60 @@ static inline float32x4_t exp_ps(float32x4_t x) {
 static inline float32x4_t pow_ps(float32x4_t a, float32x4_t b) {
     // pow(x, m) = exp(m * log(x))
     return exp_ps(vmulq_f32(b, log_ps(a)));
+}
+
+/* Higher-order atan approximation on |x| in [0, 1]. */
+static inline float32x4_t atan_approx_abs_ps(float32x4_t x_abs) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t pi_2 = vdupq_n_f32((float) (M_PI_2));
+    const float32x4_t eps = vdupq_n_f32(1e-20f);
+    const float32x4_t c1 = vdupq_n_f32(0.9998660f);
+    const float32x4_t c3 = vdupq_n_f32(-0.3302995f);
+    const float32x4_t c5 = vdupq_n_f32(0.1801410f);
+    const float32x4_t c7 = vdupq_n_f32(-0.0851330f);
+    const float32x4_t c9 = vdupq_n_f32(0.0208351f);
+
+    uint32x4_t gt1_mask = vcgtq_f32(x_abs, one);
+    float32x4_t t = vbslq_f32(gt1_mask, vdivq_f32(one, vaddq_f32(x_abs, eps)), x_abs);
+    float32x4_t t2 = vmulq_f32(t, t);
+    float32x4_t p = c9;
+    p = vmlaq_f32(c7, p, t2);
+    p = vmlaq_f32(c5, p, t2);
+    p = vmlaq_f32(c3, p, t2);
+    p = vmlaq_f32(c1, p, t2);
+    float32x4_t a = vmulq_f32(t, p);
+    return vbslq_f32(gt1_mask, vsubq_f32(pi_2, a), a);
+}
+
+/* Fully vectorized atan2 approximation with quadrant correction. */
+static inline float32x4_t atan2_approx_ps(float32x4_t y, float32x4_t x) {
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t pi = vdupq_n_f32((float) M_PI);
+    const float32x4_t pi_2 = vdupq_n_f32((float) M_PI_2);
+    const uint32x4_t sign_mask = vdupq_n_u32(0x80000000u);
+
+    float32x4_t z_abs = vabsq_f32(vdivq_f32(y, x));
+    float32x4_t a = atan_approx_abs_ps(z_abs);
+
+    // Restore sign from y/x
+    uint32x4_t sign_z = veorq_u32(vreinterpretq_u32_f32(y), vreinterpretq_u32_f32(x));
+    a = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(a), vandq_u32(sign_z, sign_mask)));
+
+    // Quadrant correction for x < 0
+    uint32x4_t x_lt0 = vcltq_f32(x, zero);
+    uint32x4_t y_ge0 = vcgeq_f32(y, zero);
+    float32x4_t add = vbslq_f32(y_ge0, pi, vnegq_f32(pi));
+    float32x4_t out = vbslq_f32(x_lt0, vaddq_f32(a, add), a);
+
+    /* Match atan2 axis behavior exactly for x == 0. */
+    uint32x4_t x_eq0 = vceqq_f32(x, zero);
+    uint32x4_t y_gt0 = vcgtq_f32(y, zero);
+    uint32x4_t y_lt0 = vcltq_f32(y, zero);
+    uint32x4_t y_eq0 = vceqq_f32(y, zero);
+    float32x4_t y_sign_pi2 =
+            vbslq_f32(y_gt0, pi_2, vbslq_f32(y_lt0, vnegq_f32(pi_2), zero));
+    out = vbslq_f32(x_eq0, y_sign_pi2, out);
+    return vbslq_f32(vandq_u32(x_eq0, y_eq0), zero, out);
 }
 
 #endif
@@ -473,6 +528,26 @@ void vDSP_zvabs(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_S
 #endif
 }
 
+void vDSP_zvphas(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC,
+                 vDSP_Length __N) {
+    vDSP_Length n = 0;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        const vDSP_Length postamble_start = __N & ~3UL;
+        for (; n < postamble_start; n += 4) {
+            const float32x4_t real4 = vld1q_f32(__A->realp + n);
+            const float32x4_t imag4 = vld1q_f32(__A->imagp + n);
+            vst1q_f32(__C + n, atan2_approx_ps(imag4, real4));
+        }
+    }
+#endif
+    for (; n < __N; ++n) {
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length ci = n * __IC;
+        __C[ci] = atan2f(__A->imagp[ai], __A->realp[ai]);
+    }
+}
+
 void vDSP_vmsa(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB,
                const float *__C, float *__D, vDSP_Stride __ID, vDSP_Length __N) {
     for (vDSP_Length n = 0; n < __N; ++n) {
@@ -548,11 +623,54 @@ void vDSP_maxvi(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length *__I
 }
 
 void vDSP_rmsqv(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length __N) {
-    float sum = 0;
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        sum += __A[n] * __A[n];
+    float meansq = 0;
+    vDSP_measqv(__A, __IA, &meansq, __N);
+    *__C = sqrtf(meansq);
+}
+
+void vDSP_vmax(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB, float *__C,
+               vDSP_Stride __IC, vDSP_Length __N) {
+    vDSP_Length n = 0;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3UL;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t b = vld1q_f32(__B + n);
+            vst1q_f32(__C + n, vmaxq_f32(a, b));
+        }
     }
-    *__C = sqrtf(sum / __N);
+#endif
+    for (; n < __N; ++n) {
+        __C[n * __IC] = fmaxf(__A[n * __IA], __B[n * __IB]);
+    }
+}
+
+void vDSP_measqv(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length __N) {
+    vDSP_Length postamble_start = __N & ~3;
+    vDSP_Length i = 0;
+    float sum = 0;
+#ifdef __ARM_NEON
+    float32x4_t sum_vec = vdupq_n_f32(0.0f);  // Initialize sum vector to zero
+    // Process 4 elements at a time using NEON intrinsics
+    for (; i < postamble_start; i += 4) {
+        float32x4_t input_vec = vld1q_f32(&__A[i]);   // Load 4 elements from input
+        float32x4_t square_vec = vmulq_f32(input_vec, input_vec);  // Square each element
+        sum_vec = vaddq_f32(sum_vec, square_vec);  // Add to the sum vector
+    }
+
+    // Horizontal sum of the elements in sum_vec
+    float sum_array[4];
+    vst1q_f32(sum_array, sum_vec);  // Store the sum vector into an array
+    sum = sum_array[0] + sum_array[1] + sum_array[2] + sum_array[3];
+#endif
+    // Process any remaining elements
+    for (; i < __N; i++) {
+        sum += __A[i] * __A[i];
+    }
+
+    // Calculate the mean of the squares
+    *__C = sum / __N;
 }
 
 void vDSP_vdbcon(const float *__A, vDSP_Stride __IA, const float *__B, float *__C, vDSP_Stride __IC,
@@ -880,9 +998,50 @@ void vDSP_mtrans(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __I
 
 void vDSP_deq22(const float *__A, vDSP_Stride __IA, const float *__B, float *__C, vDSP_Stride __IC,
                 vDSP_Length __N) {
-    for (int n = 2; n < __N + 2; ++n) {
-        __C[n] = __A[n] * __B[0] + __A[n - 1] * __B[1] + __A[n - 2] * __B[2] -
-                 __C[n - 1] * __B[3] - __C[n - 2] * __B[4];
+    if (__N == 0) {
+        return;
+    }
+    const float b0 = __B[0];
+    const float b1 = __B[1];
+    const float b2 = __B[2];
+    const float a1 = __B[3];
+    const float a2 = __B[4];
+
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        const float bc[4] = {b2, b1, b0, 0.0f};
+        const float32x4_t vb = vld1q_f32(bc);
+        const float *in = __A;
+        float *out = __C + 2;
+        for (vDSP_Length k = 0; k < __N; k++) {
+            float32x4_t xv =
+                vsetq_lane_f32(in[2], vsetq_lane_f32(in[1], vdupq_n_f32(in[0]), 1), 2);
+            float32x4_t pr = vmulq_f32(xv, vb);
+#ifdef __aarch64__
+            const float ff = vaddvq_f32(pr);
+#else
+            const float ff = AccumulateNeonLane(pr);
+#endif
+            const float y = ff - fmaf(a1, out[-1], a2 * out[-2]);
+            *out++ = y;
+            in++;
+        }
+        return;
+    }
+#endif
+
+    const float *in = __A;
+    float *out = __C + 2 * __IC;
+    for (vDSP_Length k = 0; k < __N; k++) {
+        const float s0 = *in;
+        const float s2 = in[__IA];
+        const float s1 = in[2 * __IA];
+        const float s3 = out[-2 * __IC];
+        const float s4 = out[-__IC];
+        const float y = fmaf(b2, s0, fmaf(b1, s2, fmaf(b0, s1, -fmaf(a1, s4, a2 * s3))));
+        *out = y;
+        in += __IA;
+        out += __IC;
     }
 }
 
@@ -919,6 +1078,29 @@ void vvlog10f(float *out, const float *in, const int *size) {
 void vvsqrtf(float *out, const float *in, const int *size) {
     for (int i = 0; i < *size; i++) {
         out[i] = sqrtf(in[i]);
+    }
+}
+
+void vvfloorf(float *out, const float *in, const int *size) {
+    int i = 0;
+#ifdef __ARM_NEON
+    int postamble_start = *size & ~3;
+    for (; i < postamble_start; i += 4) {
+        float32x4_t x = vld1q_f32(in + i);
+#ifdef __aarch64__
+        int32x4_t xi = vcvtmq_s32_f32(x);
+        vst1q_f32(out + i, vcvtq_f32_s32(xi));
+#else
+        int32x4_t ti = vcvtq_s32_f32(x);
+        float32x4_t tf = vcvtq_f32_s32(ti);
+        uint32x4_t gt = vcgtq_f32(tf, x);
+        tf = vsubq_f32(tf, vreinterpretq_f32_u32(vandq_u32(gt, vdupq_n_u32(0x3f800000u))));
+        vst1q_f32(out + i, tf);
+#endif
+    }
+#endif
+    for (; i < *size; i++) {
+        out[i] = floorf(in[i]);
     }
 }
 

@@ -75,6 +75,10 @@ void vDSP_zvmul(const DSPSplitComplex *__A, vDSP_Stride __IA, const DSPSplitComp
 void vDSP_zvabs(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC,
                 vDSP_Length __N);
 
+/* Computes the phase angle (in radians) of each complex element. */
+void vDSP_zvphas(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC,
+                 vDSP_Length __N);
+
 /* Vector generate by extrapolation and interpolation; single precision. */
 void vDSP_vgenp(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB, float *__C,
                 vDSP_Stride __IC, vDSP_Length __N, vDSP_Length __M);
@@ -133,6 +137,13 @@ void vDSP_maxvi(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length *__I
 
 /* Vector root-mean-square; single precision. */
 void vDSP_rmsqv(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length __N);
+
+/* Vector maximum of two vectors; single precision. */
+void vDSP_vmax(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB, float *__C,
+               vDSP_Stride __IC, vDSP_Length __N);
+
+/* Calculates the mean of squares of a single-precision vector. */
+void vDSP_measqv(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length __N);
 
 /* Copies the contents of an interleaved complex vector C to a split complex vector Z; single precision. */
 void vDSP_ctoz(const DSPComplex *__C, vDSP_Stride __IC, const DSPSplitComplex *__Z,
@@ -233,6 +244,9 @@ void vvlog10f(float *, const float *, const int *);
 
 /* Calculates the square root of each element in an array of single-precision values. */
 void vvsqrtf(float *, const float *, const int *);
+
+/* Calculates floor(x) for each element in an array of single-precision values. */
+void vvfloorf(float *, const float *, const int *);
 
 /* Raises each element in an array to the power of the corresponding element in a second array of single-precision values. */
 void vvpowf(float *, const float *, const float *, const int *);
