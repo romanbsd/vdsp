@@ -198,58 +198,63 @@ static inline float32x4_t pow_ps(float32x4_t a, float32x4_t b) {
     return exp_ps(vmulq_f32(b, log_ps(a)));
 }
 
-/* Higher-order atan approximation on |x| in [0, 1]. */
-static inline float32x4_t atan_approx_abs_ps(float32x4_t x_abs) {
-    const float32x4_t one = vdupq_n_f32(1.0f);
-    const float32x4_t pi_2 = vdupq_n_f32((float) (M_PI_2));
-    const float32x4_t eps = vdupq_n_f32(1e-20f);
-    const float32x4_t c1 = vdupq_n_f32(0.9998660f);
-    const float32x4_t c3 = vdupq_n_f32(-0.3302995f);
-    const float32x4_t c5 = vdupq_n_f32(0.1801410f);
-    const float32x4_t c7 = vdupq_n_f32(-0.0851330f);
-    const float32x4_t c9 = vdupq_n_f32(0.0208351f);
-
-    uint32x4_t gt1_mask = vcgtq_f32(x_abs, one);
-    float32x4_t t = vbslq_f32(gt1_mask, vdivq_f32(one, vaddq_f32(x_abs, eps)), x_abs);
-    float32x4_t t2 = vmulq_f32(t, t);
-    float32x4_t p = c9;
-    p = vmlaq_f32(c7, p, t2);
-    p = vmlaq_f32(c5, p, t2);
-    p = vmlaq_f32(c3, p, t2);
-    p = vmlaq_f32(c1, p, t2);
-    float32x4_t a = vmulq_f32(t, p);
-    return vbslq_f32(gt1_mask, vsubq_f32(pi_2, a), a);
+/* atan(t) for t in [0, 1]; 7-term odd Horner in z = t^2 (~8e-7 max vs atanf on [0,1]). */
+static inline float32x4_t atan_01_ps(float32x4_t t) {
+    const float32x4_t c0 = vdupq_n_f32(0.99999659f);
+    const float32x4_t c1 = vdupq_n_f32(-0.3331901f);
+    const float32x4_t c2 = vdupq_n_f32(0.19823293f);
+    const float32x4_t c3 = vdupq_n_f32(-0.13294171f);
+    const float32x4_t c4 = vdupq_n_f32(0.08076284f);
+    const float32x4_t c5 = vdupq_n_f32(-0.03461291f);
+    const float32x4_t c6 = vdupq_n_f32(0.0071513f);
+    float32x4_t z = vmulq_f32(t, t);
+    float32x4_t p = c6;
+    p = vmlaq_f32(c5, p, z);
+    p = vmlaq_f32(c4, p, z);
+    p = vmlaq_f32(c3, p, z);
+    p = vmlaq_f32(c2, p, z);
+    p = vmlaq_f32(c1, p, z);
+    p = vmlaq_f32(c0, p, z);
+    return vmulq_f32(t, p);
 }
 
-/* Fully vectorized atan2 approximation with quadrant correction. */
+/*
+ * atan2(y, x): use min(|x|,|y|)/max(|x|,|y|) in [0,1] instead of y/x — avoids blow-up when |x| is tiny.
+ * Then copysign and pi / pi/2 corrections (same idea as scalar stable atan2).
+ */
 static inline float32x4_t atan2_approx_ps(float32x4_t y, float32x4_t x) {
     const float32x4_t zero = vdupq_n_f32(0.0f);
-    const float32x4_t pi = vdupq_n_f32((float) M_PI);
-    const float32x4_t pi_2 = vdupq_n_f32((float) M_PI_2);
+    const float32x4_t pi = vdupq_n_f32((float)M_PI);
+    const float32x4_t pi_2 = vdupq_n_f32((float)M_PI_2);
+    const float32x4_t eps = vdupq_n_f32(1e-20f);
     const uint32x4_t sign_mask = vdupq_n_u32(0x80000000u);
 
-    float32x4_t z_abs = vabsq_f32(vdivq_f32(y, x));
-    float32x4_t a = atan_approx_abs_ps(z_abs);
+    float32x4_t ax = vabsq_f32(x);
+    float32x4_t ay = vabsq_f32(y);
+    float32x4_t mx = vmaxq_f32(ax, ay);
+    float32x4_t mn = vminq_f32(ax, ay);
+    float32x4_t a = vdivq_f32(mn, vaddq_f32(mx, eps));
+    float32x4_t r = atan_01_ps(a);
 
-    // Restore sign from y/x
-    uint32x4_t sign_z = veorq_u32(vreinterpretq_u32_f32(y), vreinterpretq_u32_f32(x));
-    a = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(a), vandq_u32(sign_z, sign_mask)));
+    uint32x4_t swap = vcgtq_f32(ay, ax);
+    r = vbslq_f32(swap, vsubq_f32(pi_2, r), r);
 
-    // Quadrant correction for x < 0
     uint32x4_t x_lt0 = vcltq_f32(x, zero);
-    uint32x4_t y_ge0 = vcgeq_f32(y, zero);
-    float32x4_t add = vbslq_f32(y_ge0, pi, vnegq_f32(pi));
-    float32x4_t out = vbslq_f32(x_lt0, vaddq_f32(a, add), a);
+    r = vbslq_f32(x_lt0, vsubq_f32(pi, r), r);
 
-    /* Match atan2 axis behavior exactly for x == 0. */
+    r = vreinterpretq_f32_u32(
+            veorq_u32(vreinterpretq_u32_f32(r), vandq_u32(vreinterpretq_u32_f32(y), sign_mask)));
+
     uint32x4_t x_eq0 = vceqq_f32(x, zero);
-    uint32x4_t y_gt0 = vcgtq_f32(y, zero);
-    uint32x4_t y_lt0 = vcltq_f32(y, zero);
     uint32x4_t y_eq0 = vceqq_f32(y, zero);
-    float32x4_t y_sign_pi2 =
-            vbslq_f32(y_gt0, pi_2, vbslq_f32(y_lt0, vnegq_f32(pi_2), zero));
-    out = vbslq_f32(x_eq0, y_sign_pi2, out);
-    return vbslq_f32(vandq_u32(x_eq0, y_eq0), zero, out);
+    r = vbslq_f32(vandq_u32(x_eq0, y_eq0), zero, r);
+    return r;
+}
+
+static inline float32x4_t log10_ps(float32x4_t x) {
+    /* log10(x) = ln(x) / ln(10); cephes log_ps gives NaN for x <= 0 (same idea as log10f). */
+    const float32x4_t inv_ln10 = vdupq_n_f32(0.43429448190325176f);
+    return vmulq_f32(log_ps(x), inv_ln10);
 }
 
 #endif
@@ -273,8 +278,8 @@ void vDSP_hann_window(float *__C, vDSP_Length __N, int __Flag) {
 }
 
 void vDSP_vfill(const float *__A, float *__C, vDSP_Stride __IC, vDSP_Length __N) {
-    for (vDSP_Length n = 0; n < __N; n += __IC) {
-        __C[n] = *__A;
+    for (vDSP_Length n = 0; n < __N; n++) {
+        __C[n * __IC] = *__A;
     }
 }
 
@@ -283,17 +288,19 @@ void vDSP_dotpr(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Strid
     vDSP_Length n = 0;
     *__C = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    float32x4_t c = vdupq_n_f32(0);
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t b = vld1q_f32(__B + n);
-        c = vmlaq_f32(c, a, b);
+    if (__IA == 1 && __IB == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        float32x4_t c = vdupq_n_f32(0);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t b = vld1q_f32(__B + n);
+            c = vmlaq_f32(c, a, b);
+        }
+        *__C = AccumulateNeonLane(c);
     }
-    *__C = AccumulateNeonLane(c);
 #endif
     for (; n < __N; n++) {
-        *__C += __A[n] * __B[n];
+        *__C += __A[n * __IA] * __B[n * __IB];
     }
 }
 
@@ -301,23 +308,36 @@ void vDSP_vadd(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride
                vDSP_Stride __IC, vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t b = vld1q_f32(__B + n);
-        float32x4_t c = vaddq_f32(a, b);
-        vst1q_f32(__C + n, c);
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t b = vld1q_f32(__B + n);
+            float32x4_t c = vaddq_f32(a, b);
+            vst1q_f32(__C + n, c);
+        }
     }
 #endif
-    for (; n < __N; ++n) {
-        __C[n] = __A[n] + __B[n];
+    for (; n < __N; n++) {
+        __C[n * __IC] = __A[n * __IA] + __B[n * __IB];
     }
 }
 
 void vDSP_vsub(const float *__B, vDSP_Stride __IB, const float *__A, vDSP_Stride __IA, float *__C,
                vDSP_Stride __IC, vDSP_Length __N) {
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        __C[n] = __A[n] - __B[n];
+    vDSP_Length n = 0;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3UL;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t b = vld1q_f32(__B + n);
+            vst1q_f32(__C + n, vsubq_f32(a, b));
+        }
+    }
+#endif
+    for (; n < __N; n++) {
+        __C[n * __IC] = __A[n * __IA] - __B[n * __IB];
     }
 }
 
@@ -332,30 +352,28 @@ void vDSP_vabs(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC,
         }
     }
 #endif
-    for (; n < __N; ++n) {
+    for (; n < __N; n++) {
         __C[n * __IC] = fabsf(__A[n * __IA]);
     }
 }
 
 void vDSP_vmul(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB, float *__C,
                vDSP_Stride __IC, vDSP_Length __N) {
-#ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
     vDSP_Length n = 0;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t b = vld1q_f32(__B + n);
-        float32x4_t c = vmulq_f32(a, b);
-        vst1q_f32(__C + n, c);
-    }
-    for (; n < __N; n++) {
-        __C[n] = __A[n] * __B[n];
-    }
-#else
-    for (vDSP_Length i = 0; i < __N; ++i) {
-        __C[i] = __A[i] * __B[i];
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t b = vld1q_f32(__B + n);
+            float32x4_t c = vmulq_f32(a, b);
+            vst1q_f32(__C + n, c);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        __C[n * __IC] = __A[n * __IA] * __B[n * __IB];
+    }
 }
 
 void vDSP_vdiv(const float *__B, vDSP_Stride __IB, const float *__A, vDSP_Stride __IA, float *__C,
@@ -370,60 +388,63 @@ void vDSP_zvmul(const DSPSplitComplex *__A, vDSP_Stride __IA, const DSPSplitComp
                 vDSP_Stride __IB,
                 const DSPSplitComplex *__C, vDSP_Stride __IC, vDSP_Length __N, int __Conjugate) {
     assert(__Conjugate == 1 || __Conjugate == -1);
-#ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
     vDSP_Length n = 0;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t Ar = vld1q_f32(__A->realp + n);
-        float32x4_t Br = vld1q_f32(__B->realp + n);
-        float32x4_t Ai = vld1q_f32(__A->imagp + n);
-        float32x4_t Bi = vld1q_f32(__B->imagp + n);
-        float32x4_t Cr = vmulq_f32(Ar, Br);
-        float32x4_t Ci = vmulq_f32(Ar, Bi);
-        if (__Conjugate == 1) {
-            Cr = vmlsq_f32(Cr, Ai, Bi);
-            Ci = vmlaq_f32(Ci, Ai, Br);
-        } else {
-            Cr = vmlaq_f32(Cr, Ai, Bi);
-            Ci = vmlsq_f32(Ci, Ai, Br);
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t Ar = vld1q_f32(__A->realp + n);
+            float32x4_t Br = vld1q_f32(__B->realp + n);
+            float32x4_t Ai = vld1q_f32(__A->imagp + n);
+            float32x4_t Bi = vld1q_f32(__B->imagp + n);
+            float32x4_t Cr = vmulq_f32(Ar, Br);
+            float32x4_t Ci = vmulq_f32(Ar, Bi);
+            if (__Conjugate == 1) {
+                Cr = vmlsq_f32(Cr, Ai, Bi);
+                Ci = vmlaq_f32(Ci, Ai, Br);
+            } else {
+                Cr = vmlaq_f32(Cr, Ai, Bi);
+                Ci = vmlsq_f32(Ci, Ai, Br);
+            }
+            vst1q_f32(__C->realp + n, Cr);
+            vst1q_f32(__C->imagp + n, Ci);
         }
-        vst1q_f32(__C->realp + n, Cr);
-        vst1q_f32(__C->imagp + n, Ci);
-    }
-    for (; n < __N; n++) {
-        __C->realp[n] =
-                __A->realp[n] * __B->realp[n] - (float) __Conjugate * __A->imagp[n] * __B->imagp[n];
-        __C->imagp[n] =
-                __A->realp[n] * __B->imagp[n] + (float) __Conjugate * __A->imagp[n] * __B->realp[n];
-    }
-#else
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        __C->realp[n] =
-                __A->realp[n] * __B->realp[n] - (float) __Conjugate * __A->imagp[n] * __B->imagp[n];
-        __C->imagp[n] =
-                __A->realp[n] * __B->imagp[n] + (float) __Conjugate * __A->imagp[n] * __B->realp[n];
     }
 #endif
+    for (; n < __N; n++) {
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length bi = n * __IB;
+        const vDSP_Length ci = n * __IC;
+        __C->realp[ci] =
+                __A->realp[ai] * __B->realp[bi] - (float)__Conjugate * __A->imagp[ai] * __B->imagp[bi];
+        __C->imagp[ci] =
+                __A->realp[ai] * __B->imagp[bi] + (float)__Conjugate * __A->imagp[ai] * __B->realp[bi];
+    }
 }
 
 void vDSP_zrvmul(const DSPSplitComplex *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB,
                  const DSPSplitComplex *__C, vDSP_Stride __IC, vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t Ar = vld1q_f32(__A->realp + n);
-        float32x4_t Ai = vld1q_f32(__A->imagp + n);
-        float32x4_t B = vld1q_f32(__B + n);
-        float32x4_t Cr = vmulq_f32(Ar, B);
-        float32x4_t Ci = vmulq_f32(Ai, B);
-        vst1q_f32(__C->realp + n, Cr);
-        vst1q_f32(__C->imagp + n, Ci);
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t Ar = vld1q_f32(__A->realp + n);
+            float32x4_t Ai = vld1q_f32(__A->imagp + n);
+            float32x4_t B = vld1q_f32(__B + n);
+            float32x4_t Cr = vmulq_f32(Ar, B);
+            float32x4_t Ci = vmulq_f32(Ai, B);
+            vst1q_f32(__C->realp + n, Cr);
+            vst1q_f32(__C->imagp + n, Ci);
+        }
     }
 #endif
-    for (; n < __N; ++n) {
-        __C->realp[n] = __A->realp[n] * __B[n];
-        __C->imagp[n] = __A->imagp[n] * __B[n];
+    for (; n < __N; n++) {
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length bi = n * __IB;
+        const vDSP_Length ci = n * __IC;
+        __C->realp[ci] = __A->realp[ai] * __B[bi];
+        __C->imagp[ci] = __A->imagp[ai] * __B[bi];
     }
 }
 
@@ -437,50 +458,55 @@ void vDSP_zrvdiv(const DSPSplitComplex *__A, vDSP_Stride __IA, const float *__B,
 
 void vDSP_zvadd(const DSPSplitComplex *__A, vDSP_Stride __IA, const DSPSplitComplex *__B,
                 vDSP_Stride __IB, const DSPSplitComplex *__C, vDSP_Stride __IC, vDSP_Length __N) {
-#ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
     vDSP_Length n = 0;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t Ar = vld1q_f32(__A->realp + n);
-        float32x4_t Br = vld1q_f32(__B->realp + n);
-        float32x4_t Ai = vld1q_f32(__A->imagp + n);
-        float32x4_t Bi = vld1q_f32(__B->imagp + n);
-        float32x4_t Cr = vaddq_f32(Ar, Br);
-        float32x4_t Ci = vaddq_f32(Ai, Bi);;
-        vst1q_f32(__C->realp + n, Cr);
-        vst1q_f32(__C->imagp + n, Ci);
-    }
-    for (; n < __N; n++) {
-        __C->realp[n] = __A->realp[n] + __B->realp[n];
-        __C->imagp[n] = __A->imagp[n] + __B->imagp[n];
-    }
-#else
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        __C->realp[n] = __A->realp[n] + __B->realp[n];
-        __C->imagp[n] = __A->imagp[n] + __B->imagp[n];
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t Ar = vld1q_f32(__A->realp + n);
+            float32x4_t Br = vld1q_f32(__B->realp + n);
+            float32x4_t Ai = vld1q_f32(__A->imagp + n);
+            float32x4_t Bi = vld1q_f32(__B->imagp + n);
+            float32x4_t Cr = vaddq_f32(Ar, Br);
+            float32x4_t Ci = vaddq_f32(Ai, Bi);
+            vst1q_f32(__C->realp + n, Cr);
+            vst1q_f32(__C->imagp + n, Ci);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length bi = n * __IB;
+        const vDSP_Length ci = n * __IC;
+        __C->realp[ci] = __A->realp[ai] + __B->realp[bi];
+        __C->imagp[ci] = __A->imagp[ai] + __B->imagp[bi];
+    }
 }
 
 void vDSP_zvsub(const DSPSplitComplex *__A, vDSP_Stride __IA, const DSPSplitComplex *__B,
                 vDSP_Stride __IB, const DSPSplitComplex *__C, vDSP_Stride __IC, vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t Ar = vld1q_f32(__A->realp + n);
-        float32x4_t Br = vld1q_f32(__B->realp + n);
-        float32x4_t Ai = vld1q_f32(__A->imagp + n);
-        float32x4_t Bi = vld1q_f32(__B->imagp + n);
-        float32x4_t Cr = vsubq_f32(Ar, Br);
-        float32x4_t Ci = vsubq_f32(Ai, Bi);;
-        vst1q_f32(__C->realp + n, Cr);
-        vst1q_f32(__C->imagp + n, Ci);
+    if (__IA == 1 && __IB == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t Ar = vld1q_f32(__A->realp + n);
+            float32x4_t Br = vld1q_f32(__B->realp + n);
+            float32x4_t Ai = vld1q_f32(__A->imagp + n);
+            float32x4_t Bi = vld1q_f32(__B->imagp + n);
+            float32x4_t Cr = vsubq_f32(Ar, Br);
+            float32x4_t Ci = vsubq_f32(Ai, Bi);
+            vst1q_f32(__C->realp + n, Cr);
+            vst1q_f32(__C->imagp + n, Ci);
+        }
     }
 #endif
     for (; n < __N; n++) {
-        __C->realp[n] = __A->realp[n] - __B->realp[n];
-        __C->imagp[n] = __A->imagp[n] - __B->imagp[n];
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length bi = n * __IB;
+        const vDSP_Length ci = n * __IC;
+        __C->realp[ci] = __A->realp[ai] - __B->realp[bi];
+        __C->imagp[ci] = __A->imagp[ai] - __B->imagp[bi];
     }
 }
 
@@ -489,59 +515,65 @@ void vDSP_zvma(const DSPSplitComplex *__A, vDSP_Stride __IA, const DSPSplitCompl
                const DSPSplitComplex *__D, vDSP_Stride __ID, vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t Ar = vld1q_f32(__A->realp + n);
-        float32x4_t Br = vld1q_f32(__B->realp + n);
-        float32x4_t Cr = vld1q_f32(__C->realp + n);
-        float32x4_t Ai = vld1q_f32(__A->imagp + n);
-        float32x4_t Bi = vld1q_f32(__B->imagp + n);
-        float32x4_t Ci = vld1q_f32(__C->imagp + n);
+    if (__IA == 1 && __IB == 1 && __IC == 1 && __ID == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t Ar = vld1q_f32(__A->realp + n);
+            float32x4_t Br = vld1q_f32(__B->realp + n);
+            float32x4_t Cr = vld1q_f32(__C->realp + n);
+            float32x4_t Ai = vld1q_f32(__A->imagp + n);
+            float32x4_t Bi = vld1q_f32(__B->imagp + n);
+            float32x4_t Ci = vld1q_f32(__C->imagp + n);
 
-        float32x4_t Dr = vmlaq_f32(Cr, Ar, Br);
-        Dr = vmlsq_f32(Dr, Ai, Bi);
-        vst1q_f32(__D->realp + n, Dr);
+            float32x4_t Dr = vmlaq_f32(Cr, Ar, Br);
+            Dr = vmlsq_f32(Dr, Ai, Bi);
+            vst1q_f32(__D->realp + n, Dr);
 
-        float32x4_t Di = vmlaq_f32(Ci, Ar, Bi);
-        Di = vmlaq_f32(Di, Ai, Br);
-        vst1q_f32(__D->imagp + n, Di);
+            float32x4_t Di = vmlaq_f32(Ci, Ar, Bi);
+            Di = vmlaq_f32(Di, Ai, Br);
+            vst1q_f32(__D->imagp + n, Di);
+        }
     }
 #endif
     for (; n < __N; n++) {
-        __D->realp[n] =
-                __C->realp[n] + __A->realp[n] * __B->realp[n] - __A->imagp[n] * __B->imagp[n];
-        __D->imagp[n] =
-                __C->imagp[n] + __A->realp[n] * __B->imagp[n] + __A->imagp[n] * __B->realp[n];
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length bi = n * __IB;
+        const vDSP_Length ci = n * __IC;
+        const vDSP_Length di = n * __ID;
+        __D->realp[di] =
+                __C->realp[ci] + __A->realp[ai] * __B->realp[bi] - __A->imagp[ai] * __B->imagp[bi];
+        __D->imagp[di] =
+                __C->imagp[ci] + __A->realp[ai] * __B->imagp[bi] + __A->imagp[ai] * __B->realp[bi];
     }
 }
 
 void vDSP_zvabs(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC,
                 vDSP_Length __N) {
-#ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
     vDSP_Length n = 0;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A->realp + n);
-        float32x4_t b = vld1q_f32(__A->imagp + n);
-        a = vmulq_f32(a, a);
-        a = vmlaq_f32(a, b, b);
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A->realp + n);
+            float32x4_t b = vld1q_f32(__A->imagp + n);
+            a = vmulq_f32(a, a);
+            a = vmlaq_f32(a, b, b);
 
-        float32x4_t a1 = vmaxq_f32(a, vdupq_n_f32(FLT_MIN));
-        float32x4_t e = vrsqrteq_f32(a1);
-        e = vmulq_f32(vrsqrtsq_f32(vmulq_f32(a1, e), e), e);
-        e = vmulq_f32(vrsqrtsq_f32(vmulq_f32(a1, e), e), e);
-        a = vmulq_f32(a, e);
+            float32x4_t a1 = vmaxq_f32(a, vdupq_n_f32(FLT_MIN));
+            float32x4_t e = vrsqrteq_f32(a1);
+            e = vmulq_f32(vrsqrtsq_f32(vmulq_f32(a1, e), e), e);
+            e = vmulq_f32(vrsqrtsq_f32(vmulq_f32(a1, e), e), e);
+            a = vmulq_f32(a, e);
 
-        vst1q_f32(__C + n, a);
-    }
-    for (; n < __N; n++) {
-        __C[n] = sqrtf(__A->realp[n] * __A->realp[n] + __A->imagp[n] * __A->imagp[n]);
-    }
-#else
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        __C[n] = sqrtf(__A->realp[n] * __A->realp[n] + __A->imagp[n] * __A->imagp[n]);
+            vst1q_f32(__C + n, a);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length ci = n * __IC;
+        __C[ci] = sqrtf(__A->realp[ai] * __A->realp[ai] + __A->imagp[ai] * __A->imagp[ai]);
+    }
 }
 
 void vDSP_zvphas(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC,
@@ -557,7 +589,7 @@ void vDSP_zvphas(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_
         }
     }
 #endif
-    for (; n < __N; ++n) {
+    for (; n < __N; n++) {
         const vDSP_Length ai = n * __IA;
         const vDSP_Length ci = n * __IC;
         __C[ci] = atan2f(__A->imagp[ai], __A->realp[ai]);
@@ -566,8 +598,20 @@ void vDSP_zvphas(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_
 
 void vDSP_vmsa(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB,
                const float *__C, float *__D, vDSP_Stride __ID, vDSP_Length __N) {
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        __D[n] = __A[n] * __B[n] + *__C;
+    vDSP_Length n = 0;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IB == 1 && __ID == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        const float32x4_t ck = vdupq_n_f32(*__C);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t b = vld1q_f32(__B + n);
+            vst1q_f32(__D + n, vmlaq_f32(ck, a, b));
+        }
+    }
+#endif
+    for (; n < __N; n++) {
+        __D[n * __ID] = __A[n * __IA] * __B[n * __IB] + *__C;
     }
 }
 
@@ -576,17 +620,19 @@ vDSP_vsma(const float *__A, vDSP_Stride __IA, const float *__B, const float *__C
           float *__D, vDSP_Stride __ID, vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    const float32x4_t b = vdupq_n_f32(*__B);
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t c = vld1q_f32(__C + n);
-        float32x4_t d = vmlaq_f32(c, a, b);
-        vst1q_f32(__D + n, d);
+    if (__IA == 1 && __IC == 1 && __ID == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        const float32x4_t b = vdupq_n_f32(*__B);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t c = vld1q_f32(__C + n);
+            float32x4_t d = vmlaq_f32(c, a, b);
+            vst1q_f32(__D + n, d);
+        }
     }
 #endif
     for (; n < __N; n++) {
-        __D[n] = __A[n] * *__B + __C[n];
+        __D[n * __ID] = __A[n * __IA] * *__B + __C[n * __IC];
     }
 }
 
@@ -594,17 +640,19 @@ void vDSP_vsmsa(const float *__A, vDSP_Stride __IA, const float *__B, const floa
                 vDSP_Stride __ID, vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    const float32x4_t b = vdupq_n_f32(*__B);
-    const float32x4_t c = vdupq_n_f32(*__C);
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t d = vmlaq_f32(c, a, b);
-        vst1q_f32(__D + n, d);
+    if (__IA == 1 && __ID == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        const float32x4_t b = vdupq_n_f32(*__B);
+        const float32x4_t c = vdupq_n_f32(*__C);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t d = vmlaq_f32(c, a, b);
+            vst1q_f32(__D + n, d);
+        }
     }
 #endif
     for (; n < __N; n++) {
-        __D[n] = __A[n] * *__B + *__C;
+        __D[n * __ID] = __A[n * __IA] * *__B + *__C;
     }
 }
 
@@ -613,18 +661,20 @@ void vDSP_vsmsma(const float *__A, vDSP_Stride __IA, const float *__B, const flo
                  vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    float32x4_t b = vdupq_n_f32(*__B);
-    float32x4_t d = vdupq_n_f32(*__D);
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t c = vld1q_f32(__C + n);
-        float32x4_t e = vmlaq_f32(vmulq_f32(a, b), c, d);
-        vst1q_f32(__E + n, e);
+    if (__IA == 1 && __IC == 1 && __IE == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        float32x4_t b = vdupq_n_f32(*__B);
+        float32x4_t d = vdupq_n_f32(*__D);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t c = vld1q_f32(__C + n);
+            float32x4_t e = vmlaq_f32(vmulq_f32(a, b), c, d);
+            vst1q_f32(__E + n, e);
+        }
     }
 #endif
     for (; n < __N; n++) {
-        __E[n] = __A[n] * *__B + __C[n] * *__D;
+        __E[n * __IE] = __A[n * __IA] * *__B + __C[n * __IC] * *__D;
     }
 }
 
@@ -657,75 +707,73 @@ void vDSP_vmax(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride
         }
     }
 #endif
-    for (; n < __N; ++n) {
+    for (; n < __N; n++) {
         __C[n * __IC] = fmaxf(__A[n * __IA], __B[n * __IB]);
     }
 }
 
 void vDSP_measqv(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length __N) {
-    vDSP_Length postamble_start = __N & ~3;
-    vDSP_Length i = 0;
+    vDSP_Length n = 0;
     float sum = 0;
 #ifdef __ARM_NEON
-    float32x4_t sum_vec = vdupq_n_f32(0.0f);  // Initialize sum vector to zero
-    // Process 4 elements at a time using NEON intrinsics
-    for (; i < postamble_start; i += 4) {
-        float32x4_t input_vec = vld1q_f32(&__A[i]);   // Load 4 elements from input
-        float32x4_t square_vec = vmulq_f32(input_vec, input_vec);  // Square each element
-        sum_vec = vaddq_f32(sum_vec, square_vec);  // Add to the sum vector
+    if (__IA == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        float32x4_t sum_vec = vdupq_n_f32(0.0f);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t input_vec = vld1q_f32(__A + n);
+            float32x4_t square_vec = vmulq_f32(input_vec, input_vec);
+            sum_vec = vaddq_f32(sum_vec, square_vec);
+        }
+        sum = AccumulateNeonLane(sum_vec);
     }
-
-    // Horizontal sum of the elements in sum_vec
-    float sum_array[4];
-    vst1q_f32(sum_array, sum_vec);  // Store the sum vector into an array
-    sum = sum_array[0] + sum_array[1] + sum_array[2] + sum_array[3];
 #endif
-    // Process any remaining elements
-    for (; i < __N; i++) {
-        sum += __A[i] * __A[i];
+    for (; n < __N; n++) {
+        float x = __A[n * __IA];
+        sum += x * x;
     }
 
-    // Calculate the mean of the squares
     *__C = sum / __N;
 }
 
 void vDSP_vdbcon(const float *__A, vDSP_Stride __IA, const float *__B, float *__C, vDSP_Stride __IC,
                  vDSP_Length __N, unsigned int __F) {
+    const float alpha_f = __F == 1 ? 20.f : 10.f;
+    vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    assert(__N % 4 == 0);
-    const float32x4_t alpha = vmulq_f32(vdupq_n_f32(__F == 1 ? 20 : 10),
-                                        vdupq_n_f32(0.43429448190325176f)); // 1/ln(10);
-    const float32x4_t b = vdupq_n_f32(*__B);
-    float32x4_t reciprocal = vrecpeq_f32(b);
-    // use a couple Newton-Raphson steps to refine the estimate
-    reciprocal = vmulq_f32(vrecpsq_f32(b, reciprocal), reciprocal);
-    reciprocal = vmulq_f32(vrecpsq_f32(b, reciprocal), reciprocal);
-    for (vDSP_Length i = 0; i < __N; i += 4) {
-        float32x4_t a = vld1q_f32(__A + i);
-        float32x4_t c = log_ps(vmulq_f32(a, reciprocal));
-        c = vmulq_f32(c, alpha);
-        vst1q_f32(__C + i, c);
-    }
-#else
-    const int alpha = __F == 1 ? 20 : 10;
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        __C[n] = alpha * log10f(__A[n] / *__B);
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        const float32x4_t alpha = vmulq_f32(vdupq_n_f32(alpha_f), vdupq_n_f32(0.43429448190325176f));
+        const float32x4_t b = vdupq_n_f32(*__B);
+        float32x4_t reciprocal = vrecpeq_f32(b);
+        reciprocal = vmulq_f32(vrecpsq_f32(b, reciprocal), reciprocal);
+        reciprocal = vmulq_f32(vrecpsq_f32(b, reciprocal), reciprocal);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t c = log_ps(vmulq_f32(a, reciprocal));
+            c = vmulq_f32(c, alpha);
+            vst1q_f32(__C + n, c);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        __C[n * __IC] = alpha_f * log10f(__A[n * __IA] / *__B);
+    }
 }
 
 void vDSP_vclip(const float *__A, vDSP_Stride __IA, const float *__B, const float *__C, float *__D,
                 vDSP_Stride __ID, vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    const float32x4_t b = vdupq_n_f32(*__B);
-    const float32x4_t c = vdupq_n_f32(*__C);
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        a = vminq_f32(a, c);
-        a = vmaxq_f32(a, b);
-        vst1q_f32(__D + n, a);
+    if (__IA == 1 && __ID == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        const float32x4_t b = vdupq_n_f32(*__B);
+        const float32x4_t c = vdupq_n_f32(*__C);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            a = vminq_f32(a, c);
+            a = vmaxq_f32(a, b);
+            vst1q_f32(__D + n, a);
+        }
     }
 #endif
     for (; n < __N; n++) {
@@ -743,12 +791,14 @@ void vDSP_vthr(const float *__A, vDSP_Stride __IA, const float *__B, float *__C,
                vDSP_Length __N) {
     vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    const float32x4_t b = vdupq_n_f32(*__B);
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        a = vmaxq_f32(a, b);
-        vst1q_f32(__C + n, a);
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        const float32x4_t b = vdupq_n_f32(*__B);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            a = vmaxq_f32(a, b);
+            vst1q_f32(__C + n, a);
+        }
     }
 #endif
     for (; n < __N; n++) {
@@ -830,66 +880,77 @@ void vDSP_sve(const float *__A, vDSP_Stride __I, float *__C, vDSP_Length __N) {
     vDSP_Length n = 0;
     *__C = 0;
 #ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
-    float32x4_t c = vdupq_n_f32(0);
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        c = vaddq_f32(a, c);
+    if (__I == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        float32x4_t c = vdupq_n_f32(0);
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            c = vaddq_f32(a, c);
+        }
+        *__C = AccumulateNeonLane(c);
     }
-    *__C = AccumulateNeonLane(c);
 #endif
     for (; n < __N; n++) {
-        *__C += __A[n];
+        *__C += __A[n * __I];
     }
 }
 
 void vDSP_svesq(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Length __N) {
+    vDSP_Length n = 0;
     *__C = 0;
-    for (vDSP_Length n = 0; n < __N; ++n) {
-        *__C += __A[n] * __A[n];
+#ifdef __ARM_NEON
+    if (__IA == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t sq = vmulq_f32(a, a);
+            *__C += AccumulateNeonLane(sq);
+        }
+    }
+#endif
+    for (; n < __N; n++) {
+        float x = __A[n * __IA];
+        *__C += x * x;
     }
 }
 
 void vDSP_vsmul(const float *__A, vDSP_Stride __IA, const float *__B, float *__C, vDSP_Stride __IC,
                 vDSP_Length __N) {
-#ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
+    const float b = *__B;
     vDSP_Length n = 0;
-    float32_t b = *__B;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t c = vmulq_n_f32(a, b);
-        vst1q_f32(__C + n, c);
-    }
-    for (; n < __N; n++) {
-        __C[n] = __A[n] * b;
-    }
-#else
-    for (vDSP_Length i = 0; i < __N; i++) {
-        __C[i] = __A[i] * *__B;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t c = vmulq_n_f32(a, b);
+            vst1q_f32(__C + n, c);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        __C[n * __IC] = __A[n * __IA] * b;
+    }
 }
 
 void vDSP_vsadd(const float *__A, vDSP_Stride __IA, const float *__B, float *__C, vDSP_Stride __IC,
                 vDSP_Length __N) {
-#ifdef __ARM_NEON
-    float32x4_t b = vdupq_n_f32(*__B);
-    vDSP_Length postamble_start = __N & ~3;
+    const float bk = *__B;
     vDSP_Length n = 0;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t a = vld1q_f32(__A + n);
-        float32x4_t c = vaddq_f32(a, b);
-        vst1q_f32(__C + n, c);
-    }
-    for (; n < __N; n++) {
-        __C[n] = __A[n] + *__B;
-    }
-#else
-    for (vDSP_Length i = 0; i < __N; i++) {
-        __C[i] = __A[i] + *__B;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        float32x4_t bv = vdupq_n_f32(bk);
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            float32x4_t c = vaddq_f32(a, bv);
+            vst1q_f32(__C + n, c);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        __C[n * __IC] = __A[n * __IA] + bk;
+    }
 }
 
 void vDSP_vsdiv(const float *__A, vDSP_Stride __IA, const float *__B, float *__C, vDSP_Stride __IC,
@@ -900,32 +961,48 @@ void vDSP_vsdiv(const float *__A, vDSP_Stride __IA, const float *__B, float *__C
 
 void
 vDSP_vflt16(const short *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC, vDSP_Length __N) {
+    vDSP_Length n = 0;
 #ifdef __ARM_NEON
-    for (vDSP_Length i = 0; i < __N; i += 4) {
-        // Load, convert to unsigned int, then to float
-        float32x4_t c = vcvtq_f32_s32(vmovl_s16(vld1_s16(__A + i)));
-        vst1q_f32(__C + i, c);
-    }
-#else
-    for (vDSP_Length i = 0; i < __N; i++) {
-        __C[i] = (float) __A[i];
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t c = vcvtq_f32_s32(vmovl_s16(vld1_s16(__A + n)));
+            vst1q_f32(__C + n, c);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        __C[n * __IC] = (float)__A[n * __IA];
+    }
+}
+
+static inline int16_t vdsp_saturate_truncf_to_s16(float truncated) {
+    if (truncated > 32767.0f) {
+        return 32767;
+    }
+    if (truncated < -32768.0f) {
+        return -32768;
+    }
+    return (int16_t)truncated;
 }
 
 void
 vDSP_vfix16(const float *__A, vDSP_Stride __IA, short *__C, vDSP_Stride __IC, vDSP_Length __N) {
-// #ifdef __ARM_NEON
-//   for (vDSP_Length i = 0; i < __N; i+=4) {
-//     float32x4_t a = vld1q_f32(__A + i);
-//     int16x4_t c = vmovn_s32(vcvtq_s32_f32(a));
-//     vst1_s16(__C + i, c);
-//   }
-// #else
-    for (vDSP_Length i = 0; i < __N; i++) {
-        __C[i] = (short) roundf(__A[i]);
+    vDSP_Length n = 0;
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t a = vld1q_f32(__A + n);
+            int32x4_t s32 = vcvtq_s32_f32(a);
+            int16x4_t s16 = vqmovn_s32(s32);
+            vst1_s16(__C + n, s16);
+        }
     }
-// #endif
+#endif
+    for (; n < __N; n++) {
+        __C[n * __IC] = vdsp_saturate_truncf_to_s16(truncf(__A[n * __IA]));
+    }
 }
 
 void vDSP_mmul(const float *__A, vDSP_Stride __IA, const float *__B, vDSP_Stride __IB, float *__C,
@@ -984,23 +1061,23 @@ void vDSP_zmmul(const DSPSplitComplex *__A, vDSP_Stride __IA, const DSPSplitComp
 
 void vDSP_zvmags(const DSPSplitComplex *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC,
                  vDSP_Length __N) {
-#ifdef __ARM_NEON
-    vDSP_Length postamble_start = __N & ~3;
     vDSP_Length n = 0;
-    for (; n < postamble_start; n += 4) {
-        float32x4_t Ar = vld1q_f32(__A->realp + n);
-        float32x4_t Ai = vld1q_f32(__A->imagp + n);
-        float32x4_t C = vmlaq_f32(vmulq_f32(Ar, Ar), Ai, Ai);
-        vst1q_f32(__C + n, C);
-    }
-    for (; n < __N; n++) {
-        __C[n] = __A->realp[n] * __A->realp[n] + __A->imagp[n] * __A->imagp[n];
-    }
-#else
-    for (int n = 0; n < __N; ++n) {
-        __C[n] = __A->realp[n] * __A->realp[n] + __A->imagp[n] * __A->imagp[n];
+#ifdef __ARM_NEON
+    if (__IA == 1 && __IC == 1) {
+        vDSP_Length postamble_start = __N & ~3;
+        for (; n < postamble_start; n += 4) {
+            float32x4_t Ar = vld1q_f32(__A->realp + n);
+            float32x4_t Ai = vld1q_f32(__A->imagp + n);
+            float32x4_t C = vmlaq_f32(vmulq_f32(Ar, Ar), Ai, Ai);
+            vst1q_f32(__C + n, C);
+        }
     }
 #endif
+    for (; n < __N; n++) {
+        const vDSP_Length ai = n * __IA;
+        const vDSP_Length ci = n * __IC;
+        __C[ci] = __A->realp[ai] * __A->realp[ai] + __A->imagp[ai] * __A->imagp[ai];
+    }
 }
 
 void vDSP_mtrans(const float *__A, vDSP_Stride __IA, float *__C, vDSP_Stride __IC, vDSP_Length __M,
@@ -1086,7 +1163,16 @@ void vvsinf(float *out, const float *in, const int *size) {
 }
 
 void vvlog10f(float *out, const float *in, const int *size) {
-    for (int i = 0; i < *size; i++) {
+    int i = 0;
+#ifdef __ARM_NEON
+    const int n = *size;
+    const int postamble_start = n & ~3;
+    for (; i < postamble_start; i += 4) {
+        float32x4_t X = vld1q_f32(in + i);
+        vst1q_f32(out + i, log10_ps(X));
+    }
+#endif
+    for (; i < *size; i++) {
         out[i] = log10f(in[i]);
     }
 }
